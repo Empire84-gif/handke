@@ -1,0 +1,321 @@
+from flask import Blueprint, jsonify, request, session
+
+from config import FRONTEND_URL
+from utils.db import get_connection, row_to_dict
+from utils.security import (
+    check_password,
+    generate_reset_token,
+    hash_password,
+    is_expired,
+    normalize_email,
+    now_text,
+    reset_token_expiry,
+)
+
+auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
+
+
+def get_current_user():
+    user_id = session.get("user_id")
+
+    if not user_id:
+        return None
+
+    connection = get_connection()
+
+    user = connection.execute("""
+        SELECT id, full_name, email, role, is_active, created_at, updated_at
+        FROM users
+        WHERE id = ?
+        LIMIT 1
+    """, (user_id,)).fetchone()
+
+    connection.close()
+
+    if not user:
+        return None
+
+    return row_to_dict(user)
+
+
+@auth_bp.get("/me")
+def me():
+    user = get_current_user()
+
+    if not user:
+        return jsonify({
+            "authenticated": False,
+            "user": None,
+        }), 200
+
+    return jsonify({
+        "authenticated": True,
+        "user": user,
+    }), 200
+
+
+@auth_bp.post("/login")
+def login():
+    data = request.get_json(silent=True) or {}
+
+    email = normalize_email(data.get("email"))
+    password = data.get("password") or ""
+
+    if not email or not password:
+        return jsonify({
+            "message": "Podaj email i hasło."
+        }), 400
+
+    connection = get_connection()
+
+    user = connection.execute("""
+        SELECT *
+        FROM users
+        WHERE email = ?
+        LIMIT 1
+    """, (email,)).fetchone()
+
+    connection.close()
+
+    if not user:
+        return jsonify({
+            "message": "Nieprawidłowy email lub hasło."
+        }), 401
+
+    user = row_to_dict(user)
+
+    if not user["is_active"]:
+        return jsonify({
+            "message": "Konto jest nieaktywne."
+        }), 403
+
+    if not check_password(user["password_hash"], password):
+        return jsonify({
+            "message": "Nieprawidłowy email lub hasło."
+        }), 401
+
+    session.clear()
+    session["user_id"] = user["id"]
+
+    return jsonify({
+        "message": "Zalogowano.",
+        "user": {
+            "id": user["id"],
+            "full_name": user["full_name"],
+            "email": user["email"],
+            "role": user["role"],
+        }
+    }), 200
+
+
+@auth_bp.post("/logout")
+def logout():
+    session.clear()
+
+    return jsonify({
+        "message": "Wylogowano."
+    }), 200
+
+
+@auth_bp.post("/change-password")
+def change_password():
+    user = get_current_user()
+
+    if not user:
+        return jsonify({
+            "message": "Musisz być zalogowany."
+        }), 401
+
+    data = request.get_json(silent=True) or {}
+
+    current_password = data.get("current_password") or ""
+    new_password = data.get("new_password") or ""
+
+    if len(new_password) < 8:
+        return jsonify({
+            "message": "Nowe hasło musi mieć minimum 8 znaków."
+        }), 400
+
+    connection = get_connection()
+
+    db_user = connection.execute("""
+        SELECT *
+        FROM users
+        WHERE id = ?
+        LIMIT 1
+    """, (user["id"],)).fetchone()
+
+    if not db_user:
+        connection.close()
+        return jsonify({
+            "message": "Użytkownik nie istnieje."
+        }), 404
+
+    db_user = row_to_dict(db_user)
+
+    if not check_password(db_user["password_hash"], current_password):
+        connection.close()
+        return jsonify({
+            "message": "Obecne hasło jest nieprawidłowe."
+        }), 400
+
+    connection.execute("""
+        UPDATE users
+        SET password_hash = ?,
+            updated_at = ?
+        WHERE id = ?
+    """, (
+        hash_password(new_password),
+        now_text(),
+        user["id"],
+    ))
+
+    connection.commit()
+    connection.close()
+
+    return jsonify({
+        "message": "Hasło zostało zmienione."
+    }), 200
+
+
+@auth_bp.post("/forgot-password")
+def forgot_password():
+    data = request.get_json(silent=True) or {}
+
+    email = normalize_email(data.get("email"))
+
+    if not email:
+        return jsonify({
+            "message": "Podaj adres email."
+        }), 400
+
+    connection = get_connection()
+
+    user = connection.execute("""
+        SELECT id, email, full_name
+        FROM users
+        WHERE email = ?
+        LIMIT 1
+    """, (email,)).fetchone()
+
+    if not user:
+        connection.close()
+
+        return jsonify({
+            "message": "Jeżeli konto istnieje, link resetujący został przygotowany."
+        }), 200
+
+    user = row_to_dict(user)
+
+    token = generate_reset_token()
+    current_time = now_text()
+    expires_at = reset_token_expiry(hours=1)
+
+    connection.execute("""
+        INSERT INTO password_resets (
+            user_id,
+            token,
+            expires_at,
+            used_at,
+            created_at
+        )
+        VALUES (?, ?, ?, NULL, ?)
+    """, (
+        user["id"],
+        token,
+        expires_at,
+        current_time,
+    ))
+
+    connection.commit()
+    connection.close()
+
+    reset_link = f"{FRONTEND_URL}/reset-password?token={token}"
+
+    print("")
+    print("========================================")
+    print("LINK RESETU HASŁA — DEV")
+    print(reset_link)
+    print("W produkcji ten link wyślemy mailem przez SMTP Zone.ee.")
+    print("========================================")
+    print("")
+
+    return jsonify({
+        "message": "Jeżeli konto istnieje, link resetujący został przygotowany."
+    }), 200
+
+
+@auth_bp.post("/reset-password")
+def reset_password():
+    data = request.get_json(silent=True) or {}
+
+    token = data.get("token") or ""
+    new_password = data.get("new_password") or ""
+
+    if not token:
+        return jsonify({
+            "message": "Brak tokenu resetu hasła."
+        }), 400
+
+    if len(new_password) < 8:
+        return jsonify({
+            "message": "Nowe hasło musi mieć minimum 8 znaków."
+        }), 400
+
+    connection = get_connection()
+
+    reset_row = connection.execute("""
+        SELECT *
+        FROM password_resets
+        WHERE token = ?
+        LIMIT 1
+    """, (token,)).fetchone()
+
+    if not reset_row:
+        connection.close()
+        return jsonify({
+            "message": "Link resetujący jest nieprawidłowy."
+        }), 400
+
+    reset_row = row_to_dict(reset_row)
+
+    if reset_row["used_at"]:
+        connection.close()
+        return jsonify({
+            "message": "Ten link został już użyty."
+        }), 400
+
+    if is_expired(reset_row["expires_at"]):
+        connection.close()
+        return jsonify({
+            "message": "Link resetujący wygasł."
+        }), 400
+
+    current_time = now_text()
+
+    connection.execute("""
+        UPDATE users
+        SET password_hash = ?,
+            updated_at = ?
+        WHERE id = ?
+    """, (
+        hash_password(new_password),
+        current_time,
+        reset_row["user_id"],
+    ))
+
+    connection.execute("""
+        UPDATE password_resets
+        SET used_at = ?
+        WHERE id = ?
+    """, (
+        current_time,
+        reset_row["id"],
+    ))
+
+    connection.commit()
+    connection.close()
+
+    return jsonify({
+        "message": "Hasło zostało zresetowane. Możesz się zalogować."
+    }), 200
